@@ -32,17 +32,9 @@ function getVoiceText(sign: string, language: VoiceLanguage) {
 function speakSign(sign: string, language: VoiceLanguage, onStart?: () => void, onError?: (error: string) => void) {
   const speech = window.speechSynthesis;
   if (!speech) throw new Error('Text-to-speech is not available in this browser.');
-  const audioSessionNavigator = navigator as Navigator & { audioSession?: { type: string } };
-  if (audioSessionNavigator.audioSession) audioSessionNavigator.audioSession.type = 'playback';
-  const voices = speech.getVoices();
-  const languagePrefix = language === 'ar' ? 'ar' : 'en';
-  const voice = voices.find((candidate) => candidate.lang.toLowerCase().startsWith(languagePrefix))
-    ?? voices.find((candidate) => candidate.default)
-    ?? voices[0];
   const utterance = new SpeechSynthesisUtterance(getVoiceText(sign, language));
-  // iOS Safari can return an empty voice list before its system voices finish loading.
-  // Leaving voice unset lets Safari choose its default instead of silently failing here.
-  if (voice) utterance.voice = voice;
+  // Let iOS select its own installed voice and manage its audio session. Explicitly
+  // assigning a voice or changing the session can leave Safari speech silent on iPhone.
   utterance.lang = language === 'ar' ? 'ar-EG' : 'en-US';
   utterance.volume = 1;
   utterance.rate = 0.9;
