@@ -3,10 +3,10 @@ import Constants from 'expo-constants';
 import { requestRecordingPermissionsAsync, useAudioStream } from 'expo-audio';
 import { useFocusEffect, useIsFocused, useRouter } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Platform } from 'react-native';
 import {
   ActivityIndicator,
   Alert,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -49,7 +49,6 @@ export default function TwoWayConversationScreen() {
   const [language, setLanguage] = useState<SpeechLanguage>('en');
   const [conversationActive, setConversationActive] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [listening, setListening] = useState(false);
   const [sign, setSign] = useState('Waiting for a sign…');
   const [confidence, setConfidence] = useState<number | null>(null);
   const [transcript, setTranscript] = useState('');
@@ -86,7 +85,6 @@ export default function TwoWayConversationScreen() {
       browserSpeechSession.current = null;
       if (updateUI) {
         setStarting(false);
-        setListening(false);
         setSpeechStatus('Conversation ended. Start again when ready.');
       }
       return;
@@ -116,7 +114,6 @@ export default function TwoWayConversationScreen() {
     if (socket.current === connection) socket.current = null;
     if (updateUI) {
       setStarting(false);
-      setListening(false);
       setSpeechStatus('Conversation ended. Start again when ready.');
     }
   }, [stopMicrophone]);
@@ -240,7 +237,6 @@ export default function TwoWayConversationScreen() {
           onStart: () => {
             if (!focused) return;
             setConversationActive(true);
-            setListening(true);
             setStarting(false);
             setSpeechStatus(`Listening in ${language === 'ar' ? 'Arabic' : 'English'}…`);
           },
@@ -258,7 +254,6 @@ export default function TwoWayConversationScreen() {
             if (!focused) return;
             setConversationActive(false);
             setStarting(false);
-            setListening(false);
             setSpeechStatus(message);
           },
           onEnd: () => {
@@ -266,7 +261,6 @@ export default function TwoWayConversationScreen() {
             if (!focused) return;
             setConversationActive(false);
             setStarting(false);
-            setListening(false);
             setSpeechStatus('Conversation ended. Start again when ready.');
           },
         });
@@ -306,7 +300,6 @@ export default function TwoWayConversationScreen() {
           stopMicrophone();
           setConversationActive(false);
           setStarting(false);
-          setListening(false);
           setSpeechStatus(message.message || 'Speech recognition stopped.');
         }
       };
@@ -315,7 +308,6 @@ export default function TwoWayConversationScreen() {
         stopMicrophone();
         setConversationActive(false);
         setStarting(false);
-        setListening(false);
         setSpeechStatus(`Cannot reach ${SPEECH_SERVER}. Start speech_server.py on your computer.`);
       };
       connection.onclose = () => {
@@ -323,7 +315,6 @@ export default function TwoWayConversationScreen() {
         stopMicrophone();
         if (socket.current === connection) socket.current = null;
         setStarting(false);
-        setListening(false);
       };
       connection.onopen = async () => {
         try {
@@ -331,7 +322,6 @@ export default function TwoWayConversationScreen() {
           audioActive.current = true;
           streaming.current = true;
           setConversationActive(true);
-          setListening(true);
           setStarting(false);
           setSpeechStatus(`Connecting to ${language === 'ar' ? 'Arabic' : 'English'} recognition…`);
         } catch (error) {
