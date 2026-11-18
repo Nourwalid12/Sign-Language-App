@@ -3,6 +3,7 @@ import Constants from 'expo-constants';
 import { requestRecordingPermissionsAsync, useAudioStream } from 'expo-audio';
 import { useFocusEffect, useIsFocused, useRouter } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
 import {
   ActivityIndicator,
   Alert,
@@ -12,6 +13,10 @@ import {
   Text,
   View,
 } from 'react-native';
+import { createSignRecognizer } from '@/services/sign-recognition';
+import type { SignRecognizer } from '@/services/sign-recognition.types';
+import { startBrowserSpeechRecognition } from '@/services/browser-speech-recognition';
+import type { BrowserSpeechSession } from '@/services/browser-speech-recognition.types';
 
 type RecognitionMode = 'words' | 'numbers';
 type SpeechLanguage = 'en' | 'ar';
@@ -26,7 +31,9 @@ export default function TwoWayConversationScreen() {
   const router = useRouter();
   const focused = useIsFocused();
   const cameraRef = useRef<CameraView>(null);
+  const cameraFrameRef = useRef<HTMLElement | null>(null);
   const socket = useRef<WebSocket | null>(null);
+  const browserSpeechSession = useRef<BrowserSpeechSession | null>(null);
   const inFlight = useRef(false);
   const cameraPermissionRequestStarted = useRef(false);
   const streaming = useRef(false);
@@ -35,7 +42,10 @@ export default function TwoWayConversationScreen() {
   const finalTranscript = useRef('');
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [cameraReady, setCameraReady] = useState(false);
+  const [signRecognitionReady, setSignRecognitionReady] = useState(false);
   const [mode, setMode] = useState<RecognitionMode>('words');
+  const modeRef = useRef<RecognitionMode>('words');
+  useEffect(() => { modeRef.current = mode; }, [mode]);
   const [language, setLanguage] = useState<SpeechLanguage>('en');
   const [conversationActive, setConversationActive] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -71,6 +81,16 @@ export default function TwoWayConversationScreen() {
     streaming.current = false;
     setConversationActive(false);
     stopMicrophone();
+    if (browserSpeechSession.current) {
+      browserSpeechSession.current.stop();
+      browserSpeechSession.current = null;
+      if (updateUI) {
+        setStarting(false);
+        setListening(false);
+        setSpeechStatus('Conversation ended. Start again when ready.');
+      }
+      return;
+    }
     const connection = socket.current;
     if (connection?.readyState === WebSocket.OPEN) {
       if (waitForFinal) {
@@ -110,7 +130,73 @@ export default function TwoWayConversationScreen() {
   }, [cameraPermission, focused, requestCameraPermission]);
 
   useEffect(() => {
-    if (!focused || !conversationActive || !cameraPermission?.granted || !cameraReady) return;
+    if (Platform.OS !== 'web' || !focused || !cameraPermission?.granted || !cameraReady) return;
+    let mounted = true;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let recognizer: SignRecognizer | null = null;
+    const optimizedVideos = new WeakSet<HTMLVideoElement>();
+
+    const detectLocally = () => {
+      const activeRecognizer = recognizer;
+      if (inFlight.current || !activeRecognizer) return;
+      const cameraElement = cameraFrameRef.current;
+      const video = cameraElement?.querySelector('video');
+      if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+      if (!optimizedVideos.has(video)) {
+        optimizedVideos.add(video);
+        const track = (video.srcObject as MediaStream | null)?.getVideoTracks()[0];
+        void track?.applyConstraints({
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { max: 20 },
+        }).catch(() => undefined);
+      }
+
+      inFlight.current = true;
+      try {
+        const result = activeRecognizer.predict(video, modeRef.current);
+        if (mounted) {
+          setSign(result.hand_count > 0 ? result.sign : 'Show a sign to the camera');
+          setConfidence(result.confidence ?? null);
+          setSignError('');
+        }
+      } catch (error) {
+        if (mounted) setSignError(error instanceof Error ? error.message : 'On-device sign recognition failed.');
+      } finally {
+        inFlight.current = false;
+      }
+    };
+
+    const loadRecognizer = async () => {
+      try {
+        recognizer = await createSignRecognizer();
+        if (!mounted) {
+          recognizer.close();
+          recognizer = null;
+          return;
+        }
+        setSignRecognitionReady(true);
+        timer = setInterval(detectLocally, 300);
+        detectLocally();
+      } catch (error) {
+        if (mounted) {
+          setSignRecognitionReady(false);
+          setSignError(error instanceof Error ? error.message : 'Could not load MediaPipe on this device.');
+        }
+      }
+    };
+
+    void loadRecognizer();
+    return () => {
+      mounted = false;
+      if (timer) clearInterval(timer);
+      recognizer?.close();
+      inFlight.current = false;
+    };
+  }, [cameraPermission?.granted, cameraReady, focused]);
+
+  useEffect(() => {
+    if (Platform.OS === 'web' || !focused || !conversationActive || !cameraPermission?.granted || !cameraReady) return;
     let mounted = true;
     const detect = async () => {
       if (inFlight.current || !cameraRef.current) return;
@@ -120,7 +206,7 @@ export default function TwoWayConversationScreen() {
         if (!frame?.base64) throw new Error('Could not read a camera frame.');
         const response = await fetch(`${CAMERA_SERVER.replace(/\/$/, '')}/predict`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image: frame.base64, mode }),
+          body: JSON.stringify({ image: frame.base64, mode: modeRef.current }),
         });
         const result = await response.json() as SignResponse;
         if (!response.ok) throw new Error(result.error ?? 'Sign recognition request failed.');
@@ -136,7 +222,7 @@ export default function TwoWayConversationScreen() {
     const timer = setInterval(() => { void detect(); }, 350);
     void detect();
     return () => { mounted = false; clearInterval(timer); };
-  }, [cameraPermission?.granted, cameraReady, conversationActive, focused, mode]);
+  }, [cameraPermission?.granted, cameraReady, conversationActive, focused]);
 
   const startConversation = async () => {
     if (starting || conversationActive) return;
@@ -148,6 +234,48 @@ export default function TwoWayConversationScreen() {
     setTranscript('');
     finalTranscript.current = '';
     streamConfigured.current = false;
+    if (Platform.OS === 'web') {
+      try {
+        browserSpeechSession.current = startBrowserSpeechRecognition(language, {
+          onStart: () => {
+            if (!focused) return;
+            setConversationActive(true);
+            setListening(true);
+            setStarting(false);
+            setSpeechStatus(`Listening in ${language === 'ar' ? 'Arabic' : 'English'}…`);
+          },
+          onResult: (text, isFinal) => {
+            if (!focused) return;
+            if (isFinal) {
+              finalTranscript.current = [finalTranscript.current, text].filter(Boolean).join(' ');
+              setTranscript(finalTranscript.current);
+            } else {
+              setTranscript([finalTranscript.current, text].filter(Boolean).join(' '));
+            }
+          },
+          onError: (message) => {
+            browserSpeechSession.current = null;
+            if (!focused) return;
+            setConversationActive(false);
+            setStarting(false);
+            setListening(false);
+            setSpeechStatus(message);
+          },
+          onEnd: () => {
+            browserSpeechSession.current = null;
+            if (!focused) return;
+            setConversationActive(false);
+            setStarting(false);
+            setListening(false);
+            setSpeechStatus('Conversation ended. Start again when ready.');
+          },
+        });
+      } catch (error) {
+        setStarting(false);
+        setSpeechStatus(error instanceof Error ? error.message : 'Could not start browser speech recognition.');
+      }
+      return;
+    }
     setSpeechStatus('Requesting microphone access…');
     try {
       const permission = await requestRecordingPermissionsAsync();
@@ -229,7 +357,7 @@ export default function TwoWayConversationScreen() {
       </View>
       <Text style={styles.description}>Sign and speak naturally. Both results appear here as text.</Text>
 
-      <View style={styles.cameraFrame}>
+      <View ref={(instance) => { cameraFrameRef.current = instance as unknown as HTMLElement | null; }} style={styles.cameraFrame}>
         {cameraPermission?.granted && focused ? (
           <CameraView
             ref={cameraRef} style={StyleSheet.absoluteFill} facing="front" mirror
@@ -237,12 +365,14 @@ export default function TwoWayConversationScreen() {
             onMountError={({ message }) => { setCameraReady(false); setSignError(message); }}
           />
         ) : <View style={styles.cameraPlaceholder}><Text style={styles.cameraPlaceholderText}>Allow camera access to recognize signs</Text></View>}
-        <View style={styles.cameraStatus}><Text style={styles.cameraStatusText}>{conversationActive ? 'Sign recognition is running' : 'Camera ready for the conversation'}</Text></View>
+        <View style={styles.cameraStatus}><Text style={styles.cameraStatusText}>{Platform.OS === 'web' || conversationActive ? 'Sign recognition is running' : 'Camera ready for the conversation'}</Text></View>
       </View>
 
       <View style={styles.resultCard}>
         <Text style={styles.sectionTitle}>Sign from the deaf person</Text>
-        <Text style={styles.resultText}>{sign}</Text>
+        <Text style={styles.resultText}>
+          {Platform.OS === 'web' && cameraReady && !signRecognitionReady ? 'Loading sign recognition…' : sign}
+        </Text>
         {confidence !== null ? <Text style={styles.confidence}>Confidence: {confidence}%</Text> : null}
         {signError ? <Text style={styles.error}>{signError}</Text> : null}
       </View>

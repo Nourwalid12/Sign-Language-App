@@ -2,7 +2,9 @@ import Constants from 'expo-constants';
 import { requestRecordingPermissionsAsync, useAudioStream } from 'expo-audio';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { startBrowserSpeechRecognition } from '@/services/browser-speech-recognition';
+import type { BrowserSpeechSession } from '@/services/browser-speech-recognition.types';
 
 type SpeechServerMessage = {
   type: 'ready' | 'partial' | 'final' | 'finished' | 'error';
@@ -33,6 +35,7 @@ export default function SpeechToTextScreen() {
   const finishWaiter = useRef<(() => void) | null>(null);
   const focused = useRef(false);
   const audioActive = useRef(false);
+  const browserSession = useRef<BrowserSpeechSession | null>(null);
 
   const { stream } = useAudioStream({
     channels: 1,
@@ -65,6 +68,17 @@ export default function SpeechToTextScreen() {
     stopRequested.current = true;
     streaming.current = false;
     stopMicrophone();
+
+    if (browserSession.current) {
+      browserSession.current.stop();
+      browserSession.current = null;
+      if (updateUI) {
+        setIsListening(false);
+        setIsStarting(false);
+        setStatus('Tap the microphone to speak again.');
+      }
+      return;
+    }
 
     const connection = socket.current;
     if (connection?.readyState === WebSocket.OPEN) {
@@ -152,6 +166,50 @@ export default function SpeechToTextScreen() {
     if (isListening) {
       setStatus('Finishing your words…');
       await stopSpeechSession(true);
+      return;
+    }
+
+    if (Platform.OS === 'web') {
+      setIsStarting(true);
+      setStatus('Starting browser speech recognition…');
+      setTranscript('');
+      finalTranscript.current = '';
+      try {
+        browserSession.current = startBrowserSpeechRecognition(language, {
+          onStart: () => {
+            if (!focused.current) return;
+            setIsStarting(false);
+            setIsListening(true);
+            setStatus(`Listening in ${language === 'ar' ? 'Arabic' : 'English'}…`);
+          },
+          onResult: (text, isFinal) => {
+            if (!focused.current) return;
+            if (isFinal) {
+              finalTranscript.current = [finalTranscript.current, text].filter(Boolean).join(' ');
+              setTranscript(finalTranscript.current);
+            } else {
+              setTranscript([finalTranscript.current, text].filter(Boolean).join(' '));
+            }
+          },
+          onError: (message) => {
+            browserSession.current = null;
+            if (!focused.current) return;
+            setIsStarting(false);
+            setIsListening(false);
+            setStatus(message);
+          },
+          onEnd: () => {
+            browserSession.current = null;
+            if (!focused.current) return;
+            setIsStarting(false);
+            setIsListening(false);
+            setStatus('Tap the microphone to speak again.');
+          },
+        });
+      } catch (error) {
+        setIsStarting(false);
+        setStatus(error instanceof Error ? error.message : 'Could not start browser speech recognition.');
+      }
       return;
     }
 
@@ -307,7 +365,9 @@ export default function SpeechToTextScreen() {
 
       <Text style={styles.status}>{status}</Text>
       <Text style={styles.note}>
-        Live {language === 'ar' ? 'Arabic' : 'English (US)'} recognition · Computer and iPhone must share Wi-Fi
+        {Platform.OS === 'web'
+          ? `Browser ${language === 'ar' ? 'Arabic' : 'English'} recognition · Internet and browser support required`
+          : `Live ${language === 'ar' ? 'Arabic' : 'English (US)'} recognition · Computer and iPhone must share Wi-Fi`}
       </Text>
     </ScrollView>
   );

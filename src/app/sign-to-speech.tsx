@@ -2,6 +2,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import Constants from 'expo-constants';
 import { useIsFocused, useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
 import {
   ActivityIndicator,
   Pressable,
@@ -11,8 +12,46 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { createSignRecognizer } from '@/services/sign-recognition';
+import type { SignRecognizer } from '@/services/sign-recognition.types';
 
 type RecognitionMode = 'words' | 'numbers';
+type VoiceLanguage = 'en' | 'ar';
+
+const arabicWords: Record<string, string> = {
+  Bye: 'مع السلامة', Hello: 'مرحباً', I: 'أنا', No: 'لا', Perfect: 'ممتاز',
+  'Thank You': 'شكراً', Yes: 'نعم', help: 'مساعدة', i_love_you: 'أحبك',
+  my: 'لي', name: 'اسم', want: 'أريد',
+  '0': 'صفر', '1': 'واحد', '2': 'اثنان', '3': 'ثلاثة', '4': 'أربعة',
+};
+
+function getVoiceText(sign: string, language: VoiceLanguage) {
+  return language === 'ar' ? (arabicWords[sign] ?? sign) : sign.replaceAll('_', ' ');
+}
+
+function speakSign(sign: string, language: VoiceLanguage, onStart?: () => void, onError?: (error: string) => void) {
+  const speech = window.speechSynthesis;
+  if (!speech) throw new Error('Text-to-speech is not available in this browser.');
+  const audioSessionNavigator = navigator as Navigator & { audioSession?: { type: string } };
+  if (audioSessionNavigator.audioSession) audioSessionNavigator.audioSession.type = 'playback';
+  const voices = speech.getVoices();
+  const languagePrefix = language === 'ar' ? 'ar' : 'en';
+  const voice = voices.find((candidate) => candidate.lang.toLowerCase().startsWith(languagePrefix))
+    ?? voices.find((candidate) => candidate.default)
+    ?? voices[0];
+  const utterance = new SpeechSynthesisUtterance(getVoiceText(sign, language));
+  // iOS Safari can return an empty voice list before its system voices finish loading.
+  // Leaving voice unset lets Safari choose its default instead of silently failing here.
+  if (voice) utterance.voice = voice;
+  utterance.lang = language === 'ar' ? 'ar-EG' : 'en-US';
+  utterance.volume = 1;
+  utterance.rate = 0.9;
+  utterance.onstart = onStart ?? null;
+  utterance.onerror = (event) => onError?.(event.error);
+  // Keep the first utterance started by the user's tap alive. iOS Safari can block
+  // the automatic sign utterance if it cancels that user-initiated speech session.
+  speech.speak(utterance);
+}
 
 type RecognitionResponse = {
   hand_count: number;
@@ -30,6 +69,7 @@ export default function SignToSpeechScreen() {
   const router = useRouter();
   const isFocused = useIsFocused();
   const cameraRef = useRef<CameraView>(null);
+  const cameraFrameRef = useRef<HTMLElement | null>(null);
   const [permission, requestPermission] = useCameraPermissions();
   const requestInFlight = useRef(false);
   const retryAfter = useRef(0);
@@ -37,11 +77,58 @@ export default function SignToSpeechScreen() {
   const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
   const [cameraReady, setCameraReady] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
+  const [recognitionReady, setRecognitionReady] = useState(false);
   const [mode, setMode] = useState<RecognitionMode>('words');
+  const [voiceLanguage, setVoiceLanguage] = useState<VoiceLanguage>('en');
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState('Tap Enable voice to hear signs.');
+  const modeRef = useRef<RecognitionMode>('words');
+  const spokenSign = useRef<string | null>(null);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
   const [handCount, setHandCount] = useState<number | null>(null);
   const [prediction, setPrediction] = useState<string | null>(null);
   const [confidence, setConfidence] = useState<number | null>(null);
   const [error, setError] = useState('');
+
+  const speakFromTap = (language: VoiceLanguage) => {
+    const sample = handCount && prediction
+      ? prediction
+      : language === 'ar' ? 'الصوت يعمل الآن' : 'Voice is ready';
+    try {
+      speakSign(sample, language,
+        () => setVoiceStatus('Voice is working.'),
+        (reason) => setError(`Voice playback failed (${reason}). Check that your phone has a ${language === 'ar' ? 'Arabic' : 'English'} speech voice installed.`),
+      );
+      if (handCount && prediction) spokenSign.current = `${language}:${prediction}`;
+      setVoiceEnabled(true);
+      setVoiceStatus('Voice enabled. Hold a sign in view.');
+      setError('');
+    } catch (speechError) {
+      setError(speechError instanceof Error ? speechError.message : 'Could not enable voice output.');
+    }
+  };
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !voiceEnabled || !recognitionReady || handCount === 0 || !prediction) return;
+    const timer = window.setTimeout(() => {
+      if (spokenSign.current === `${voiceLanguage}:${prediction}`) return;
+      try {
+        const text = getVoiceText(prediction, voiceLanguage);
+        speakSign(prediction, voiceLanguage,
+          () => setVoiceStatus(`Speaking: ${text}`),
+          (reason) => setError(`Voice playback failed (${reason}). Check that your phone has a ${voiceLanguage === 'ar' ? 'Arabic' : 'English'} speech voice installed.`),
+        );
+      } catch (speechError) {
+        setError(speechError instanceof Error ? speechError.message : 'Could not speak the recognized sign.');
+      }
+      spokenSign.current = `${voiceLanguage}:${prediction}`;
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [handCount, prediction, recognitionReady, voiceEnabled, voiceLanguage]);
+
+  useEffect(() => () => {
+    if (Platform.OS === 'web') window.speechSynthesis?.cancel();
+  }, []);
 
   useEffect(() => {
     if (!permission || permission.granted || permissionRequestStarted.current) return;
@@ -57,6 +144,76 @@ export default function SignToSpeechScreen() {
     if (!isFocused || !cameraReady || !isDetecting) return;
 
     let mounted = true;
+    if (Platform.OS === 'web') {
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let recognizer: SignRecognizer | null = null;
+      const optimizedVideos = new WeakSet<HTMLVideoElement>();
+
+      const detectLocally = () => {
+        const activeRecognizer = recognizer;
+        if (requestInFlight.current || !activeRecognizer) return;
+        const cameraElement = cameraFrameRef.current;
+        const video = cameraElement?.querySelector('video');
+        if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+        if (!optimizedVideos.has(video)) {
+          optimizedVideos.add(video);
+          const track = (video.srcObject as MediaStream | null)?.getVideoTracks()[0];
+          void track?.applyConstraints({
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { max: 20 },
+          }).catch(() => undefined);
+        }
+
+        requestInFlight.current = true;
+        try {
+          const result = activeRecognizer.predict(video, modeRef.current);
+          if (mounted) {
+            setHandCount(result.hand_count);
+            setPrediction(result.sign);
+            setConfidence(result.confidence);
+            setError('');
+          }
+        } catch (detectionError) {
+          if (mounted) {
+            setError(detectionError instanceof Error ? detectionError.message : 'On-device sign recognition failed.');
+            setIsDetecting(false);
+          }
+        } finally {
+          requestInFlight.current = false;
+        }
+      };
+
+      const loadRecognizer = async () => {
+        try {
+          recognizer = await createSignRecognizer();
+          if (!mounted) {
+            recognizer.close();
+            recognizer = null;
+            return;
+          }
+          setError('');
+          setRecognitionReady(true);
+          timer = setInterval(detectLocally, 300);
+          detectLocally();
+        } catch (recognizerError) {
+          if (mounted) {
+            setRecognitionReady(false);
+            setError(recognizerError instanceof Error ? recognizerError.message : 'Could not load MediaPipe on this device.');
+            setIsDetecting(false);
+          }
+        }
+      };
+
+      void loadRecognizer();
+      return () => {
+        mounted = false;
+        if (timer) clearInterval(timer);
+        recognizer?.close();
+        requestInFlight.current = false;
+      };
+    }
+
     const detectHand = async () => {
       if (requestInFlight.current || !cameraRef.current) return;
       requestInFlight.current = true;
@@ -72,7 +229,7 @@ export default function SignToSpeechScreen() {
         const response = await fetch(`${serverUrl.replace(/\/$/, '')}/predict`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image: photo.base64, mode }),
+          body: JSON.stringify({ image: photo.base64, mode: modeRef.current }),
         });
         const result = (await response.json()) as RecognitionResponse;
         if (!response.ok) throw new Error(result.error ?? 'Sign recognition request failed.');
@@ -107,7 +264,7 @@ export default function SignToSpeechScreen() {
       mounted = false;
       clearInterval(timer);
     };
-  }, [cameraReady, isDetecting, isFocused, mode, serverUrl]);
+  }, [cameraReady, isDetecting, isFocused, serverUrl]);
 
   return (
     <ScrollView contentContainerStyle={styles.container} showsVerticalScrollIndicator={false}>
@@ -128,7 +285,7 @@ export default function SignToSpeechScreen() {
       </Text>
 
       {permission?.granted && isFocused ? (
-        <View style={styles.cameraFrame}>
+        <View ref={(instance) => { cameraFrameRef.current = instance as unknown as HTMLElement | null; }} style={styles.cameraFrame}>
           <CameraView
             ref={cameraRef}
             style={StyleSheet.absoluteFill}
@@ -154,7 +311,7 @@ export default function SignToSpeechScreen() {
           <View style={styles.cameraStatus}>
             {isDetecting ? <ActivityIndicator color="#FFFFFF" size="small" /> : null}
             <Text style={styles.cameraStatusText}>
-              {isDetecting ? 'Looking for a hand…' : 'Center your hand in the frame'}
+              {isDetecting ? (recognitionReady ? 'Looking for a hand…' : 'Loading sign recognition…') : 'Center your hand in the frame'}
             </Text>
           </View>
         </View>
@@ -187,7 +344,7 @@ export default function SignToSpeechScreen() {
           {isDetecting ? <ActivityIndicator color="#0A7656" size="small" /> : null}
         </View>
         <Text style={styles.resultText}>
-          {prediction ?? (isDetecting ? 'Waiting for a hand…' : 'Opening camera…')}
+          {prediction ?? (isDetecting ? (recognitionReady ? 'Waiting for a hand…' : 'Loading sign recognition…') : 'Opening camera…')}
         </Text>
         {handCount !== null && handCount > 0 ? (
           <Text style={styles.confidence}>
@@ -231,20 +388,78 @@ export default function SignToSpeechScreen() {
         </Pressable>
       </View>
 
+      {Platform.OS === 'web' ? (
+        <>
+          <View style={styles.voiceHeading}>
+            <Text style={styles.sectionLabel}>Voice language</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ selected: voiceEnabled }}
+              style={[styles.voiceButton, voiceEnabled && styles.voiceButtonActive]}
+              onPress={() => {
+                if (voiceEnabled) {
+                  window.speechSynthesis?.cancel();
+                  setVoiceEnabled(false);
+                  return;
+                }
+                speakFromTap(voiceLanguage);
+              }}
+            >
+              <Text style={styles.voiceButtonText}>{voiceEnabled ? '🔊 Voice on' : '🔈 Enable voice'}</Text>
+            </Pressable>
+          </View>
+          <Text style={styles.voiceStatus}>{voiceStatus}</Text>
+          <View style={styles.modeToggle}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ selected: voiceLanguage === 'en' }}
+              style={[styles.modeButton, voiceLanguage === 'en' && styles.modeButtonActive]}
+              onPress={() => {
+                setVoiceLanguage('en');
+                if (voiceEnabled) speakFromTap('en');
+              }}
+            >
+              <Text style={[styles.modeButtonText, voiceLanguage === 'en' && styles.modeButtonTextActive]}>English</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ selected: voiceLanguage === 'ar' }}
+              style={[styles.modeButton, voiceLanguage === 'ar' && styles.modeButtonActive]}
+              onPress={() => {
+                setVoiceLanguage('ar');
+                if (voiceEnabled) speakFromTap('ar');
+              }}
+            >
+              <Text style={[styles.modeButtonText, voiceLanguage === 'ar' && styles.modeButtonTextActive]}>العربية</Text>
+            </Pressable>
+          </View>
+        </>
+      ) : null}
+
       <View style={styles.connectionCard}>
-        <Text style={styles.sectionLabel}>MediaPipe server URL</Text>
-        <TextInput
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-          onChangeText={setServerUrl}
-          placeholder="http://192.168.1.12:5001"
-          placeholderTextColor="#87958C"
-          style={styles.serverInput}
-          value={serverUrl}
-        />
+        <Text style={styles.sectionLabel}>{Platform.OS === 'web' ? 'MediaPipe model' : 'MediaPipe server URL'}</Text>
+        {Platform.OS === 'web' ? (
+          <TextInput
+            editable={false}
+            style={styles.serverInput}
+            value="Runs on this device"
+          />
+        ) : (
+          <TextInput
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="url"
+            onChangeText={setServerUrl}
+            placeholder="http://192.168.1.12:5001"
+            placeholderTextColor="#87958C"
+            style={styles.serverInput}
+            value={serverUrl}
+          />
+        )}
         <Text style={styles.helperText}>
-          Use your computer’s Wi-Fi address. Keep both devices on the same Wi-Fi.
+          {Platform.OS === 'web'
+            ? 'Signs are recognized on your phone. No server or Wi-Fi setup is needed.'
+            : 'Use your computer’s Wi-Fi address. Keep both devices on the same Wi-Fi.'}
         </Text>
       </View>
 
@@ -260,7 +475,7 @@ export default function SignToSpeechScreen() {
             setIsDetecting(true);
           }}
         >
-          <Text style={styles.retryButtonText}>Retry connection</Text>
+          <Text style={styles.retryButtonText}>{Platform.OS === 'web' ? 'Retry recognition' : 'Retry connection'}</Text>
         </Pressable>
       ) : null}
 
@@ -304,6 +519,11 @@ const styles = StyleSheet.create({
   confidence: { color: '#4D6357', fontSize: 13, textAlign: 'center', marginTop: 3 },
   sectionLabel: { color: '#29483B', fontSize: 13, fontWeight: '700', marginBottom: 8 },
   modeToggle: { flexDirection: 'row', backgroundColor: '#E9E6D9', borderRadius: 15, padding: 4, marginBottom: 14 },
+  voiceHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
+  voiceButton: { backgroundColor: '#E9E6D9', borderRadius: 13, paddingHorizontal: 13, paddingVertical: 8 },
+  voiceButtonActive: { backgroundColor: '#D4EBDD' },
+  voiceButtonText: { color: '#0B684F', fontSize: 12, fontWeight: '700' },
+  voiceStatus: { color: '#69776F', fontSize: 12, lineHeight: 18, marginTop: -3, marginBottom: 9 },
   modeButton: { flex: 1, alignItems: 'center', borderRadius: 12, paddingVertical: 11 },
   modeButtonActive: { backgroundColor: '#0B684F' },
   modeButtonText: { color: '#526159', fontWeight: '700', fontSize: 14 },

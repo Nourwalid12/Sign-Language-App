@@ -12,8 +12,7 @@ from flask import Flask, request, jsonify
 # Reuse the classifiers and prediction logic used by the MediaPipe website.
 backend_dir = Path(os.environ.get(
     "SIGN_RECOGNITION_PROJECT",
-    str(Path.home() / "Downloads" / "sign-language-recognition-nour-updates"
-        / "sign-language-recognition-nour-updates"),
+    str(Path.home() / "sign-language-recognition"),
 ))
 if not (backend_dir / "app.py").is_file():
     raise RuntimeError(
