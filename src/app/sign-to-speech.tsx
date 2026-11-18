@@ -14,6 +14,16 @@ import {
 } from 'react-native';
 import { createSignRecognizer } from '@/services/sign-recognition';
 import type { SignRecognizer } from '@/services/sign-recognition.types';
+import { CameraSourcePicker } from '@/components/camera-source-picker';
+import { PiCameraStream } from '@/components/pi-camera-stream';
+import {
+  isSecurePiStreamUrl,
+  loadCameraSource,
+  loadPiStreamUrl,
+  saveCameraSource,
+  savePiStreamUrl,
+} from '@/services/camera-source';
+import type { CameraSource } from '@/services/camera-source';
 
 type RecognitionMode = 'words' | 'numbers';
 type VoiceLanguage = 'en' | 'ar';
@@ -118,6 +128,8 @@ export default function SignToSpeechScreen() {
   const cameraRef = useRef<CameraView>(null);
   const cameraFrameRef = useRef<HTMLElement | null>(null);
   const [permission, requestPermission] = useCameraPermissions();
+  const [cameraSource, setCameraSourceState] = useState<CameraSource>(loadCameraSource);
+  const [piStreamUrl, setPiStreamUrlState] = useState(loadPiStreamUrl);
   const requestInFlight = useRef(false);
   const retryAfter = useRef(0);
   const permissionRequestStarted = useRef(false);
@@ -137,6 +149,27 @@ export default function SignToSpeechScreen() {
   const [prediction, setPrediction] = useState<string | null>(null);
   const [confidence, setConfidence] = useState<number | null>(null);
   const [error, setError] = useState('');
+  const usesPiCamera = Platform.OS === 'web' && cameraSource === 'pi';
+  const securePiStreamUrl = isSecurePiStreamUrl(piStreamUrl.trim()) ? piStreamUrl.trim() : '';
+
+  const changeCameraSource = (source: CameraSource) => {
+    setCameraSourceState(source);
+    saveCameraSource(source);
+    setCameraReady(false);
+    setIsDetecting(source === 'mobile' && permission?.granted === true);
+    setHandCount(null);
+    setPrediction(null);
+    setConfidence(null);
+    setError('');
+  };
+
+  const changePiStreamUrl = (url: string) => {
+    setPiStreamUrlState(url);
+    savePiStreamUrl(url);
+    setCameraReady(false);
+    setIsDetecting(false);
+    setError('');
+  };
 
   const speakFromTap = (language: VoiceLanguage) => {
     const selectedSign = handCount && prediction ? prediction : null;
@@ -184,14 +217,14 @@ export default function SignToSpeechScreen() {
   }, []);
 
   useEffect(() => {
-    if (!permission || permission.granted || permissionRequestStarted.current) return;
+    if ((Platform.OS === 'web' && cameraSource === 'pi') || !permission || permission.granted || permissionRequestStarted.current) return;
     permissionRequestStarted.current = true;
     void requestPermission().then((result) => {
       if (!result.granted) setError('Camera access is needed to recognize signs.');
     }).catch(() => {
       setError('Could not request camera access. Check the app permissions in your phone settings.');
     });
-  }, [permission, requestPermission]);
+  }, [cameraSource, permission, requestPermission]);
 
   useEffect(() => {
     if (!isFocused || !cameraReady || !isDetecting) return;
@@ -206,9 +239,14 @@ export default function SignToSpeechScreen() {
         const activeRecognizer = recognizer;
         if (requestInFlight.current || !activeRecognizer) return;
         const cameraElement = cameraFrameRef.current;
-        const video = cameraElement?.querySelector('video');
-        if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-        if (!optimizedVideos.has(video)) {
+        const frame = cameraElement?.querySelector('video, img') as HTMLVideoElement | HTMLImageElement | null | undefined;
+        if (!frame) return;
+        const video = frame instanceof HTMLVideoElement ? frame : null;
+        const image = frame instanceof HTMLImageElement ? frame : null;
+        if (video && video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+        if (image && (!image.complete || image.naturalWidth === 0)) return;
+        if (!video && !image) return;
+        if (video && !optimizedVideos.has(video)) {
           optimizedVideos.add(video);
           const track = (video.srcObject as MediaStream | null)?.getVideoTracks()[0];
           void track?.applyConstraints({
@@ -220,7 +258,7 @@ export default function SignToSpeechScreen() {
 
         requestInFlight.current = true;
         try {
-          const result = activeRecognizer.predict(video, modeRef.current);
+          const result = activeRecognizer.predict(frame, modeRef.current);
           if (mounted) {
             setHandCount(result.hand_count);
             setPrediction(result.sign);
@@ -337,24 +375,49 @@ export default function SignToSpeechScreen() {
         Show a sign to the camera. Recognition starts automatically.
       </Text>
 
-      {permission?.granted && isFocused ? (
+      {Platform.OS === 'web' ? (
+        <CameraSourcePicker
+          source={cameraSource}
+          onSourceChange={changeCameraSource}
+          streamUrl={piStreamUrl}
+          onStreamUrlChange={changePiStreamUrl}
+        />
+      ) : null}
+
+      {(usesPiCamera ? Boolean(securePiStreamUrl) : permission?.granted && isFocused) ? (
         <View ref={(instance) => { cameraFrameRef.current = instance as unknown as HTMLElement | null; }} style={styles.cameraFrame}>
-          <CameraView
-            ref={cameraRef}
-            style={StyleSheet.absoluteFill}
-            facing="front"
-            mirror
-            onCameraReady={() => {
-              setCameraReady(true);
-              setIsDetecting(true);
-              setError('');
-            }}
-            onMountError={({ message }) => {
-              setCameraReady(false);
-              setIsDetecting(false);
-              setError(message);
-            }}
-          />
+          {usesPiCamera ? (
+            <PiCameraStream
+              url={securePiStreamUrl}
+              onLoad={() => {
+                setCameraReady(true);
+                setIsDetecting(true);
+                setError('');
+              }}
+              onError={() => {
+                setCameraReady(false);
+                setIsDetecting(false);
+                setError('Could not load the Raspberry Pi stream. Check that its HTTPS tunnel is running and the URL is correct.');
+              }}
+            />
+          ) : (
+            <CameraView
+              ref={cameraRef}
+              style={StyleSheet.absoluteFill}
+              facing="front"
+              mirror
+              onCameraReady={() => {
+                setCameraReady(true);
+                setIsDetecting(true);
+                setError('');
+              }}
+              onMountError={({ message }) => {
+                setCameraReady(false);
+                setIsDetecting(false);
+                setError(message);
+              }}
+            />
+          )}
           <View pointerEvents="none" style={styles.cameraCorners}>
             <View style={[styles.corner, styles.cornerTopLeft]} />
             <View style={[styles.corner, styles.cornerTopRight]} />
@@ -371,11 +434,13 @@ export default function SignToSpeechScreen() {
       ) : (
         <View style={styles.cameraPlaceholder}>
           <View style={styles.placeholderIconCircle}><Text style={styles.placeholderIcon}>▣</Text></View>
-          <Text style={styles.cameraTitle}>{permission ? 'Camera access needed' : 'Opening camera…'}</Text>
+          <Text style={styles.cameraTitle}>{usesPiCamera ? 'Pi camera stream needed' : permission ? 'Camera access needed' : 'Opening camera…'}</Text>
           <Text style={styles.cameraDescription}>
-            Allow camera access so SignBridge can recognize signs and numbers.
+            {usesPiCamera
+              ? 'Paste a secure HTTPS stream URL above to use the Raspberry Pi camera.'
+              : 'Allow camera access so SignBridge can recognize signs and numbers.'}
           </Text>
-          {!permission?.granted ? (
+          {!usesPiCamera && !permission?.granted ? (
             <Pressable
               style={styles.allowButton}
               onPress={() => void requestPermission()}
@@ -516,7 +581,7 @@ export default function SignToSpeechScreen() {
         </Text>
       </View>
 
-      {error && permission?.granted ? (
+      {error && (usesPiCamera || permission?.granted) ? (
         <Pressable
           style={styles.retryButton}
           onPress={() => {

@@ -7,6 +7,6 @@ export type SignRecognitionResult = {
 };
 
 export type SignRecognizer = {
-  predict: (video: HTMLVideoElement, mode: RecognitionMode) => SignRecognitionResult;
+  predict: (frame: HTMLVideoElement | HTMLImageElement, mode: RecognitionMode) => SignRecognitionResult;
   close: () => void;
 };

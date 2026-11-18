@@ -221,13 +221,13 @@ export async function createSignRecognizer(): Promise<SignRecognizer> {
     dynamicCache = { label: null, confidence: 0 };
   };
 
-  const predict = (video: HTMLVideoElement, mode: RecognitionMode): SignRecognitionResult => {
+  const predict = (frame: HTMLVideoElement | HTMLImageElement, mode: RecognitionMode): SignRecognitionResult => {
     if (currentMode !== mode) {
       currentMode = mode;
       resetSequence();
     }
 
-    const result = landmarker.detectForVideo(video, performance.now());
+    const result = landmarker.detectForVideo(frame, performance.now());
     const hands = result.landmarks;
     if (hands.length === 0) {
       resetSequence();

@@ -17,6 +17,16 @@ import { createSignRecognizer } from '@/services/sign-recognition';
 import type { SignRecognizer } from '@/services/sign-recognition.types';
 import { startBrowserSpeechRecognition } from '@/services/browser-speech-recognition';
 import type { BrowserSpeechSession } from '@/services/browser-speech-recognition.types';
+import { CameraSourcePicker } from '@/components/camera-source-picker';
+import { PiCameraStream } from '@/components/pi-camera-stream';
+import {
+  isSecurePiStreamUrl,
+  loadCameraSource,
+  loadPiStreamUrl,
+  saveCameraSource,
+  savePiStreamUrl,
+} from '@/services/camera-source';
+import type { CameraSource } from '@/services/camera-source';
 
 type RecognitionMode = 'words' | 'numbers';
 type SpeechLanguage = 'en' | 'ar';
@@ -41,6 +51,8 @@ export default function TwoWayConversationScreen() {
   const streamConfigured = useRef(false);
   const finalTranscript = useRef('');
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [cameraSource, setCameraSourceState] = useState<CameraSource>(loadCameraSource);
+  const [piStreamUrl, setPiStreamUrlState] = useState(loadPiStreamUrl);
   const [cameraReady, setCameraReady] = useState(false);
   const [signRecognitionReady, setSignRecognitionReady] = useState(false);
   const [mode, setMode] = useState<RecognitionMode>('words');
@@ -54,6 +66,24 @@ export default function TwoWayConversationScreen() {
   const [transcript, setTranscript] = useState('');
   const [speechStatus, setSpeechStatus] = useState('Start a conversation to use the microphone.');
   const [signError, setSignError] = useState('');
+  const usesPiCamera = Platform.OS === 'web' && cameraSource === 'pi';
+  const securePiStreamUrl = isSecurePiStreamUrl(piStreamUrl.trim()) ? piStreamUrl.trim() : '';
+
+  const changeCameraSource = (source: CameraSource) => {
+    setCameraSourceState(source);
+    saveCameraSource(source);
+    setCameraReady(false);
+    setSign('Waiting for a sign…');
+    setConfidence(null);
+    setSignError('');
+  };
+
+  const changePiStreamUrl = (url: string) => {
+    setPiStreamUrlState(url);
+    savePiStreamUrl(url);
+    setCameraReady(false);
+    setSignError('');
+  };
 
   const { stream } = useAudioStream({
     channels: 1,
@@ -121,13 +151,13 @@ export default function TwoWayConversationScreen() {
   useFocusEffect(useCallback(() => () => { void stopConversation(false, false); }, [stopConversation]));
 
   useEffect(() => {
-    if (!focused || !cameraPermission || cameraPermission.granted || cameraPermissionRequestStarted.current) return;
+    if ((Platform.OS === 'web' && cameraSource === 'pi') || !focused || !cameraPermission || cameraPermission.granted || cameraPermissionRequestStarted.current) return;
     cameraPermissionRequestStarted.current = true;
     void requestCameraPermission();
-  }, [cameraPermission, focused, requestCameraPermission]);
+  }, [cameraPermission, cameraSource, focused, requestCameraPermission]);
 
   useEffect(() => {
-    if (Platform.OS !== 'web' || !focused || !cameraPermission?.granted || !cameraReady) return;
+    if (Platform.OS !== 'web' || !focused || (!usesPiCamera && !cameraPermission?.granted) || !cameraReady) return;
     let mounted = true;
     let timer: ReturnType<typeof setInterval> | undefined;
     let recognizer: SignRecognizer | null = null;
@@ -137,9 +167,14 @@ export default function TwoWayConversationScreen() {
       const activeRecognizer = recognizer;
       if (inFlight.current || !activeRecognizer) return;
       const cameraElement = cameraFrameRef.current;
-      const video = cameraElement?.querySelector('video');
-      if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-      if (!optimizedVideos.has(video)) {
+      const frame = cameraElement?.querySelector('video, img') as HTMLVideoElement | HTMLImageElement | null | undefined;
+      if (!frame) return;
+      const video = frame instanceof HTMLVideoElement ? frame : null;
+      const image = frame instanceof HTMLImageElement ? frame : null;
+      if (video && video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+      if (image && (!image.complete || image.naturalWidth === 0)) return;
+      if (!video && !image) return;
+      if (video && !optimizedVideos.has(video)) {
         optimizedVideos.add(video);
         const track = (video.srcObject as MediaStream | null)?.getVideoTracks()[0];
         void track?.applyConstraints({
@@ -151,7 +186,7 @@ export default function TwoWayConversationScreen() {
 
       inFlight.current = true;
       try {
-        const result = activeRecognizer.predict(video, modeRef.current);
+        const result = activeRecognizer.predict(frame, modeRef.current);
         if (mounted) {
           setSign(result.hand_count > 0 ? result.sign : 'Show a sign to the camera');
           setConfidence(result.confidence ?? null);
@@ -190,7 +225,7 @@ export default function TwoWayConversationScreen() {
       recognizer?.close();
       inFlight.current = false;
     };
-  }, [cameraPermission?.granted, cameraReady, focused]);
+  }, [cameraPermission?.granted, cameraReady, focused, usesPiCamera]);
 
   useEffect(() => {
     if (Platform.OS === 'web' || !focused || !conversationActive || !cameraPermission?.granted || !cameraReady) return;
@@ -223,7 +258,7 @@ export default function TwoWayConversationScreen() {
 
   const startConversation = async () => {
     if (starting || conversationActive) return;
-    if (!cameraPermission?.granted) {
+    if (!usesPiCamera && !cameraPermission?.granted) {
       const result = await requestCameraPermission();
       if (!result.granted) { Alert.alert('Camera access needed', 'Allow camera access to recognize signs.'); return; }
     }
@@ -347,8 +382,30 @@ export default function TwoWayConversationScreen() {
       </View>
       <Text style={styles.description}>Sign and speak naturally. Both results appear here as text.</Text>
 
+      {Platform.OS === 'web' ? (
+        <CameraSourcePicker
+          source={cameraSource}
+          onSourceChange={changeCameraSource}
+          streamUrl={piStreamUrl}
+          onStreamUrlChange={changePiStreamUrl}
+        />
+      ) : null}
+
       <View ref={(instance) => { cameraFrameRef.current = instance as unknown as HTMLElement | null; }} style={styles.cameraFrame}>
-        {cameraPermission?.granted && focused ? (
+        {usesPiCamera ? (
+          securePiStreamUrl ? (
+            <PiCameraStream
+              url={securePiStreamUrl}
+              onLoad={() => { setCameraReady(true); setSignError(''); }}
+              onError={() => {
+                setCameraReady(false);
+                setSignError('Could not load the Raspberry Pi stream. Check that its HTTPS tunnel is running and the URL is correct.');
+              }}
+            />
+          ) : (
+            <View style={styles.cameraPlaceholder}><Text style={styles.cameraPlaceholderText}>Paste a secure HTTPS Pi stream URL above</Text></View>
+          )
+        ) : cameraPermission?.granted && focused ? (
           <CameraView
             ref={cameraRef} style={StyleSheet.absoluteFill} facing="front" mirror
             onCameraReady={() => setCameraReady(true)}
