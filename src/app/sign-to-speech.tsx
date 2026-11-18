@@ -29,20 +29,102 @@ function getVoiceText(sign: string, language: VoiceLanguage) {
   return language === 'ar' ? (arabicWords[sign] ?? sign) : sign.replaceAll('_', ' ');
 }
 
-function speakSign(sign: string, language: VoiceLanguage, onStart?: () => void, onError?: (error: string) => void) {
-  const speech = window.speechSynthesis;
-  if (!speech) throw new Error('Text-to-speech is not available in this browser.');
-  const utterance = new SpeechSynthesisUtterance(getVoiceText(sign, language));
-  // Let iOS select its own installed voice and manage its audio session. Explicitly
-  // assigning a voice or changing the session can leave Safari speech silent on iPhone.
-  utterance.lang = language === 'ar' ? 'ar-EG' : 'en-US';
-  utterance.volume = 1;
-  utterance.rate = 0.9;
-  utterance.onstart = onStart ?? null;
-  utterance.onerror = (event) => onError?.(event.error);
-  // Keep the first utterance started by the user's tap alive. iOS Safari can block
-  // the automatic sign utterance if it cancels that user-initiated speech session.
-  speech.speak(utterance);
+type SignVoicePlayer = {
+  play: (assetKey: string) => Promise<void>;
+  stop: () => void;
+  dispose: () => void;
+};
+
+function getVoiceAssetKey(sign: string, language: VoiceLanguage) {
+  const clipName = /^\d+$/.test(sign)
+    ? `number-${sign}`
+    : sign.toLowerCase().replaceAll('_', '-').replaceAll(' ', '-');
+  return `${language}/${clipName}`;
+}
+
+function createSignVoicePlayer(): SignVoicePlayer {
+  if (!window.AudioContext) throw new Error('Audio playback is not available in this browser.');
+  const context = new window.AudioContext();
+  const buffers = new Map<string, Promise<AudioBuffer>>();
+  let activeSource: AudioBufferSourceNode | null = null;
+  let pendingAsset: string | null = null;
+  let loading = false;
+  let disposed = false;
+  let generation = 0;
+
+  const loadBuffer = (assetKey: string) => {
+    const existing = buffers.get(assetKey);
+    if (existing) return existing;
+
+    const request = fetch(`/sign-voices/${assetKey}.wav`)
+      .then((response) => {
+        if (!response.ok) throw new Error(`Could not load the ${assetKey.split('/')[0]} voice audio.`);
+        return response.arrayBuffer();
+      })
+      .then((audioData) => context.decodeAudioData(audioData));
+    buffers.set(assetKey, request);
+    void request.catch(() => buffers.delete(assetKey));
+    return request;
+  };
+
+  const playNext = async (assetKey: string, playGeneration: number): Promise<void> => {
+    if (disposed || playGeneration !== generation) return;
+    if (loading || activeSource) {
+      pendingAsset = assetKey;
+      return;
+    }
+
+    loading = true;
+    try {
+      const buffer = await loadBuffer(assetKey);
+      if (context.state !== 'running') await context.resume();
+      if (disposed || playGeneration !== generation) return;
+
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      activeSource = source;
+      source.onended = () => {
+        if (activeSource === source) activeSource = null;
+        const nextAsset = pendingAsset;
+        pendingAsset = null;
+        if (nextAsset) void playNext(nextAsset, generation);
+      };
+      source.start();
+    } finally {
+      loading = false;
+      if (!activeSource && pendingAsset && !disposed) {
+        const nextAsset = pendingAsset;
+        pendingAsset = null;
+        void playNext(nextAsset, generation);
+      }
+    }
+  };
+
+  return {
+    play: (assetKey) => {
+      // resume() is invoked synchronously from Enable voice, which unlocks Web Audio on iOS.
+      const resume = context.state === 'running' ? Promise.resolve() : context.resume();
+      const playGeneration = generation;
+      return resume.then(() => playNext(assetKey, playGeneration));
+    },
+    stop: () => {
+      generation += 1;
+      pendingAsset = null;
+      const source = activeSource;
+      activeSource = null;
+      source?.stop();
+    },
+    dispose: () => {
+      disposed = true;
+      generation += 1;
+      pendingAsset = null;
+      const source = activeSource;
+      activeSource = null;
+      source?.stop();
+      void context.close();
+    },
+  };
 }
 
 type RecognitionResponse = {
@@ -76,6 +158,7 @@ export default function SignToSpeechScreen() {
   const [voiceStatus, setVoiceStatus] = useState('Tap Enable voice to hear signs.');
   const modeRef = useRef<RecognitionMode>('words');
   const spokenSign = useRef<string | null>(null);
+  const voicePlayer = useRef<SignVoicePlayer | null>(null);
   useEffect(() => { modeRef.current = mode; }, [mode]);
   const [handCount, setHandCount] = useState<number | null>(null);
   const [prediction, setPrediction] = useState<string | null>(null);
@@ -83,18 +166,24 @@ export default function SignToSpeechScreen() {
   const [error, setError] = useState('');
 
   const speakFromTap = (language: VoiceLanguage) => {
-    const sample = handCount && prediction
-      ? prediction
-      : language === 'ar' ? 'الصوت يعمل الآن' : 'Voice is ready';
+    const selectedSign = handCount && prediction ? prediction : null;
+    const assetKey = selectedSign
+      ? getVoiceAssetKey(selectedSign, language)
+      : `${language}/ready`;
     try {
-      speakSign(sample, language,
-        () => setVoiceStatus('Voice is working.'),
-        (reason) => setError(`Voice playback failed (${reason}). Check that your phone has a ${language === 'ar' ? 'Arabic' : 'English'} speech voice installed.`),
-      );
-      if (handCount && prediction) spokenSign.current = `${language}:${prediction}`;
+      const player = voicePlayer.current ?? createSignVoicePlayer();
+      voicePlayer.current = player;
+      if (selectedSign) spokenSign.current = `${language}:${selectedSign}`;
       setVoiceEnabled(true);
-      setVoiceStatus('Voice enabled. Hold a sign in view.');
       setError('');
+      setVoiceStatus('Loading voice…');
+      void player.play(assetKey).then(() => {
+        setVoiceStatus(selectedSign ? `Speaking: ${getVoiceText(selectedSign, language)}` : 'Voice is working.');
+      }).catch((audioError) => {
+        setVoiceEnabled(false);
+        setVoiceStatus('Tap Enable voice to hear signs.');
+        setError(audioError instanceof Error ? audioError.message : 'Could not play the voice audio.');
+      });
     } catch (speechError) {
       setError(speechError instanceof Error ? speechError.message : 'Could not enable voice output.');
     }
@@ -104,22 +193,21 @@ export default function SignToSpeechScreen() {
     if (Platform.OS !== 'web' || !voiceEnabled || !recognitionReady || handCount === 0 || !prediction) return;
     const timer = window.setTimeout(() => {
       if (spokenSign.current === `${voiceLanguage}:${prediction}`) return;
-      try {
-        const text = getVoiceText(prediction, voiceLanguage);
-        speakSign(prediction, voiceLanguage,
-          () => setVoiceStatus(`Speaking: ${text}`),
-          (reason) => setError(`Voice playback failed (${reason}). Check that your phone has a ${voiceLanguage === 'ar' ? 'Arabic' : 'English'} speech voice installed.`),
-        );
-      } catch (speechError) {
-        setError(speechError instanceof Error ? speechError.message : 'Could not speak the recognized sign.');
-      }
       spokenSign.current = `${voiceLanguage}:${prediction}`;
+      const player = voicePlayer.current;
+      if (!player) return;
+      void player.play(getVoiceAssetKey(prediction, voiceLanguage)).then(() => {
+        setVoiceStatus(`Speaking: ${getVoiceText(prediction, voiceLanguage)}`);
+      }).catch((audioError) => {
+        setError(audioError instanceof Error ? audioError.message : 'Could not play the recognized sign.');
+      });
     }, 600);
     return () => window.clearTimeout(timer);
   }, [handCount, prediction, recognitionReady, voiceEnabled, voiceLanguage]);
 
   useEffect(() => () => {
-    if (Platform.OS === 'web') window.speechSynthesis?.cancel();
+    voicePlayer.current?.dispose();
+    voicePlayer.current = null;
   }, []);
 
   useEffect(() => {
@@ -390,7 +478,7 @@ export default function SignToSpeechScreen() {
               style={[styles.voiceButton, voiceEnabled && styles.voiceButtonActive]}
               onPress={() => {
                 if (voiceEnabled) {
-                  window.speechSynthesis?.cancel();
+                  voicePlayer.current?.stop();
                   setVoiceEnabled(false);
                   return;
                 }
